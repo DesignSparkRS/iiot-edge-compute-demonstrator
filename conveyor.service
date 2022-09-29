@@ -1,0 +1,14 @@
+[Unit]
+Description=IIoT Edge Conveyor Demonstrator
+Requires=cockpit.service
+After=cockpit.service
+
+[Service]
+ExecStart=/opt/demo/bin/plc-conveyor
+Restart=always
+RestartSec=3
+User=bb
+Group=bb
+
+[Install]
+WantedBy=multi-user.target

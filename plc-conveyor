@@ -1,0 +1,279 @@
+#!/usr/bin/python3
+# Copyright (c) 2022 RS Components Ltd
+# SPDX-License-Identifier: Apache License 2.0
+
+import sys
+import time
+import json
+import brainboxes
+import paho.mqtt.publish as publish
+from binascii import unhexlify
+
+# MQTT configuration
+
+mqtt_broker = 'localhost'
+sensor_topic = 'conveyor/sensors'
+state_topic = 'conveyor/state'
+
+# ASCII TCP servers
+
+bb400ip = '127.0.0.1'
+ed538ip = '192.168.127.254'
+ed549ip = '192.168.127.253'
+
+# Sensor constants
+
+volts_mult = 3
+amps_mult = 0.5
+temp_mult = 10
+vib_mult = 10
+meas_dp = 2
+
+# Beacon amber > green transition delay (s)
+
+beaconDelay = 2
+
+# Initialise variables
+
+enst = runst = prevRunst = False
+step = 0
+
+# Check if a bit is set
+
+def isBitSet(resp, pos):
+    intval = int.from_bytes(unhexlify((resp[3:])), byteorder='big')
+    return intval & 1 << pos != 0
+
+# Read BB-400 digital inputs (stop and start buttons)
+
+def readBB400():
+    try:
+        with brainboxes.AsciiIo(ipaddr=bb400ip, port=9500, timeout=1.0) as bb400:
+            rxdata = bb400.command_response(b'@01')
+    except:
+        print('  *** BB-400 read: Failed to connect!')
+
+    if rxdata is None:
+        print('  *** BB-400 read: No response received!')
+        return
+
+    elif len(rxdata) != 5:
+        print('  *** BB-400 read: Bad response received!')
+        return
+
+    else:
+        pb_stop = isBitSet(rxdata, 1)
+        pb_start = isBitSet(rxdata, 0)
+        return(pb_stop, pb_start)
+
+# Read ED-538 digital inputs (system enable state + fault push buttons)
+
+def readED538():
+    try:
+        with brainboxes.AsciiIo(ipaddr=ed538ip, port=9500, timeout=1.0) as ed538:
+            rxdata = ed538.command_response(b'@01')
+    except:
+        print('  *** ED-538 read: Failed to connect!')
+        return
+
+    if rxdata is None:
+        print('  *** ED-538 read: No response received!')
+        return
+
+    elif len(rxdata) != 5:
+        print('  *** ED-538 read: Bad response received!')
+        return
+
+    else:
+        enable = isBitSet(rxdata, 0)
+        pb_volt = isBitSet(rxdata, 4)
+        pb_cur = isBitSet(rxdata, 5)
+        pb_temp = isBitSet(rxdata, 6)
+        pb_vib = isBitSet(rxdata, 7)
+        return(enable, pb_volt, pb_cur, pb_temp, pb_vib)
+
+# Read ED-549 analogue inputs (supply voltage + current, temperature, vibration)
+
+def readED549():
+    try:
+        with brainboxes.AsciiIo(ipaddr=ed549ip, port=9500, timeout=1.0) as ed549:
+            rxdata = ed549.command_response(b'#01')
+    except:
+        print('  *** ED-549 read: Failed to connect!')  
+
+    if rxdata is None:
+        print('  *** ED-549 read: No response received!')
+        return
+
+    elif len(rxdata) != 57:
+        print('  *** ED-549 read: Bad response received!')
+        return
+
+    else:
+        sup_volts = round(float(rxdata[2:6]) * volts_mult, meas_dp)
+        sup_amps = round(float(rxdata[9:15]) * amps_mult, meas_dp)
+        motor_tempc = round(float(rxdata[16:22]) * temp_mult, meas_dp) 
+        motor_vib = round(float(rxdata[23:27]) * vib_mult, meas_dp) 
+        return(sup_volts, sup_amps, motor_tempc, motor_vib)
+
+# Evaluate run state
+
+def getRun():
+    try:
+        stop, start = readBB400()
+        if stop == False and start == True:
+            return False
+        elif stop == True and start == False:
+            return True
+        else:
+            return
+    except:
+        print('  *** getRun: Failed to read BB-400!')
+
+# Set the beacon colour
+
+def setBeacon(colour):
+    if colour == 'red':
+        msgs = (b'#011600', b'#011500', b'#011401')
+    elif colour == 'amber':
+        msgs = (b'#011600', b'#011400', b'#011501')
+    elif colour == 'green':
+        msgs = (b'#011400', b'#011500', b'#011601')
+    else:
+        print('  *** BB-400 setBeacon invalid colour: {0}'.format(colour))
+        return
+
+    try:
+        with brainboxes.AsciiIo(ipaddr=bb400ip, port=9500, timeout=1.0) as bb400:
+            for txdata in msgs:
+                data = bb400.command_noresponse(txdata)
+                time.sleep(0.01)
+    except:
+        print('  *** BB-400 setBeacon: Failed to connect!')
+
+# Set the conveyor state
+
+def setConveyor(state):
+    if state == 'stop':
+        txdata = b'#010A00'
+    elif state == 'run':
+        txdata = b'#010A01'
+    else:
+        print('  *** ED-538 setConveyor invalid state: {0}'.format(state))
+        return
+
+    try:
+        with brainboxes.AsciiIo(ipaddr=ed538ip, port=9500, timeout=1.0) as ed538:
+            data = ed538.command_noresponse(txdata)
+    except:
+        print('  *** ED-538 setConveyor: Failed to connect!')
+
+# Set process step
+
+def setStep():
+    global step, tick
+    print('  Running step: {0}'.format(step))
+
+    if step == 0:
+        setConveyor('stop')
+        setBeacon('red')
+    elif step == 1:
+        setBeacon('amber')
+    elif step == 2:
+        setBeacon('green')
+        setConveyor('run')
+    else:
+        step = 0
+
+    tick = time.time()
+
+# Initialise process
+
+setStep()
+
+# Main process loop
+
+while True:
+    try:
+        # Save previous run state
+        prevRunst = runst
+
+        # Read ED-538 inputs (enable circuit and fault push buttons)
+        try:
+            enable, pb_volt, pb_cur, pb_temp, pb_vib = readED538()
+        except:
+            print('  *** Failed to read ED-538')
+
+        # Set the enable state
+        if enable != None:
+            enst = enable
+
+        # Read and obey start/stop buttons if we're enabled
+        if enst == True:
+            run = getRun()
+            if run != None: 
+                runst = run
+        else:
+            runst = False
+
+        # Stop if required
+        if runst == False and prevRunst == True:
+            print('  Stopping! Run: {0} // Enable: {1}'.format(runst, enst))
+            runst = False
+            step = 0
+            setStep()
+
+        # Run the plant process
+        if runst == True:
+            if step == 0:
+                step = 1
+                setStep()
+
+            elif step == 1: 
+                if time.time()-tick > beaconDelay:
+                    step = 2
+                    setStep()
+            else:
+                pass
+
+        else:
+            print('  Run: {0} // Enable: {1}'.format(runst, enst))
+
+        # Read the analogue inputs
+        try:
+            volts, amps, tempc, vib = readED549()
+        except:
+            print('  *** Failed to read ED-549!')
+
+        # Fomat process data and publish
+        try:
+            process_state = {
+                'enable_state': enst,
+                'run_state': runst,
+                'step': step,
+                'voltage_fault': pb_volt,
+                'current_fault': pb_cur,
+                'temperature_fault': pb_temp,
+                'vibration_fault': pb_vib
+            }
+
+            process_sensors = {
+                'supply_voltage': volts,
+                'supply_current': amps,
+                'motor_temperature': tempc,
+                'motor_vibration': vib
+            }
+
+            msgs = [{'topic':state_topic, 'payload':json.dumps(process_state)}, 
+                (sensor_topic, json.dumps(process_sensors), 0, False)]
+
+            publish.multiple(msgs, hostname=mqtt_broker, client_id='conveyor')
+        except:
+            print('  *** Failed to publish to MQTT broker!')
+
+        # Don't scan too fast
+        time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print('CTRL+C pressed - Exit!')
+        sys.exit()
